@@ -33,16 +33,38 @@ import (
 
 const (
 	CHUNK      = 128 * 1024
-	STORE      = "./storage"
-	EXT        = ".enc"
+	STORE      = "./site"
+	EXT        = ".hat"
 	MaxRetries = 5
 )
 
+// HTTP-like protocol constants
+const (
+	// Request methods
+	METHOD_REQUEST = "REQUEST" // GET equivalent
+	METHOD_OPINION = "OPINION" // POST/PUT equivalent
+	METHOD_CHANGE  = "CHANGE"  // PATCH equivalent
+	METHOD_REMOVE  = "REMOVE"  // DELETE equivalent
+
+	// Response statuses
+	STATUS_GOOD    = "GOOD"    // 200 OK
+	STATUS_BAD     = "BAD"     // Generic error
+	STATUS_WTF     = "WTF"     // Bad request (400)
+	STATUS_NOTHERE = "NOTHERE" // Not found (404)
+
+	// Frame markers
+	FRAME_START   = "HAT\n"
+	FRAME_END     = "\nStatus: "
+	TYPE_HEADER   = "Type: "
+	CONTENT_START = "CSH\n"
+	CONTENT_END   = "\nCEH"
+)
+
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00FF00"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00FF00"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
 	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
-	infoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
+	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
 )
 
 type Crypto struct {
@@ -127,12 +149,99 @@ type Stat struct {
 	up   time.Time
 }
 
+type HATRequest struct {
+	Method string // REQUEST, OPINION, CHANGE, REMOVE
+	Path   string // Resource path
+	Type   string // Content type (text, html, etc.)
+	Body   string // Request body
+}
+
+type HATResponse struct {
+	Type   string // Content type
+	Body   string // Response body
+	Status string // GOOD, BAD, WTF, NOTHERE
+}
+
+// Encode HTTP response into frame format
+func encodeHATResponse(resp *HATResponse) string {
+	var sb strings.Builder
+	sb.WriteString(FRAME_START)
+	sb.WriteString(TYPE_HEADER)
+	sb.WriteString(resp.Type)
+	sb.WriteString("\n\n")
+	sb.WriteString(CONTENT_START)
+	sb.WriteString(resp.Body)
+	sb.WriteString(CONTENT_END)
+	sb.WriteString(FRAME_END)
+	sb.WriteString(resp.Status)
+	return sb.String()
+}
+
+// Decode HTTP request from frame format
+func decodeHATRequest(data []byte) (*HATRequest, error) {
+	content := string(data)
+
+	// Check if it's a valid frame
+	if !strings.HasPrefix(content, FRAME_START) {
+		return nil, fmt.Errorf("invalid frame start")
+	}
+
+	// Extract method (first word after HAT)
+	lines := strings.Split(strings.TrimPrefix(content, FRAME_START), "\n")
+	if len(lines) < 2 {
+		return nil, fmt.Errorf("invalid frame format")
+	}
+
+	methodLine := lines[0]
+	methodParts := strings.Fields(methodLine)
+	if len(methodParts) < 2 {
+		return nil, fmt.Errorf("invalid method line")
+	}
+
+	method := methodParts[0]
+	path := methodParts[1]
+
+	// Extract type
+	var contentType string
+	contentStartIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, TYPE_HEADER) {
+			contentType = strings.TrimPrefix(line, TYPE_HEADER)
+		} else if line == strings.TrimSuffix(CONTENT_START, "\n") {
+			contentStartIdx = i + 1
+			break
+		}
+	}
+
+	if contentStartIdx == -1 {
+		return nil, fmt.Errorf("content start marker not found")
+	}
+
+	// Extract body (everything between CSH and CEH)
+	var bodyLines []string
+	for i := contentStartIdx; i < len(lines); i++ {
+		if lines[i] == strings.TrimSuffix(CONTENT_END, "\n") {
+			break
+		}
+		bodyLines = append(bodyLines, lines[i])
+	}
+
+	body := strings.Join(bodyLines, "\n")
+
+	return &HATRequest{
+		Method: method,
+		Path:   path,
+		Type:   contentType,
+		Body:   body,
+	}, nil
+}
+
 func NewSrv(port uint16, pass string) (*Srv, error) {
-	tls, _ := genTLS()
+	tlsGen, _ := genTLS()
 	os.MkdirAll(STORE, 0755)
 	return &Srv{
 		port:   port,
-		tls:    tls,
+		tls:    tlsGen,
 		crypto: NewCrypto(pass),
 		files:  []string{},
 		stats:  make(map[string]*Stat),
@@ -189,6 +298,8 @@ func (s *Srv) handle(conn quic.Connection, ui *SrvUI) {
 		s.download(st, ui)
 	case 2:
 		s.list(st, ui)
+	case 3: // HTTP-like protocol
+		s.handleHAT(st, ui)
 	}
 }
 
@@ -276,6 +387,239 @@ func (s *Srv) list(st quic.Stream, ui *SrvUI) {
 		binary.Write(st, binary.BigEndian, uint32(len(f)))
 		st.Write([]byte(f))
 		binary.Write(st, binary.BigEndian, uint64(stat.size))
+	}
+}
+
+func (s *Srv) handleHAT(st quic.Stream, ui *SrvUI) {
+	// Read the entire request
+	var reqLen uint32
+	binary.Read(st, binary.BigEndian, &reqLen)
+	reqData := make([]byte, reqLen)
+	io.ReadFull(st, reqData)
+
+	// Decode the request
+	req, err := decodeHATRequest(reqData)
+	if err != nil {
+		resp := &HATResponse{
+			Type:   "text",
+			Body:   "Invalid request format",
+			Status: STATUS_WTF,
+		}
+		respData := encodeHATResponse(resp)
+		binary.Write(st, binary.BigEndian, uint32(len(respData)))
+		st.Write([]byte(respData))
+		return
+	}
+
+	ui.Log(fmt.Sprintf("HTTP %s %s Type: %s", req.Method, req.Path, req.Type))
+
+	// Handle different methods
+	var resp *HATResponse
+	switch req.Method {
+	case METHOD_REQUEST: // GET-like
+		resp = s.handleHATGet(req, ui)
+	case METHOD_OPINION: // POST/PUT-like
+		resp = s.handleHATPostPut(req, ui)
+	case METHOD_CHANGE: // PATCH-like
+		resp = s.handleHATPatch(req, ui)
+	case METHOD_REMOVE: // DELETE-like
+		resp = s.handleHATDelete(req, ui)
+	default:
+		resp = &HATResponse{
+			Type:   "text",
+			Body:   "Unknown method",
+			Status: STATUS_WTF,
+		}
+	}
+
+	// Send response
+	respData := encodeHATResponse(resp)
+	binary.Write(st, binary.BigEndian, uint32(len(respData)))
+	st.Write([]byte(respData))
+}
+
+func (s *Srv) handleHATGet(req *HATRequest, ui *SrvUI) *HATResponse {
+	// Simple file serving logic
+	filePath := filepath.Join(STORE, req.Path+EXT)
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Resource not found",
+			Status: STATUS_NOTHERE,
+		}
+	}
+
+	// Read and decrypt file
+	encData, err := os.ReadFile(filePath)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to read resource",
+			Status: STATUS_BAD,
+		}
+	}
+
+	compData, err := s.crypto.Dec(encData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to decrypt resource",
+			Status: STATUS_BAD,
+		}
+	}
+
+	data, err := unzip(compData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to decompress resource",
+			Status: STATUS_BAD,
+		}
+	}
+
+	return &HATResponse{
+		Type:   req.Type,
+		Body:   string(data),
+		Status: STATUS_GOOD,
+	}
+}
+
+func (s *Srv) handleHATPostPut(req *HATRequest, ui *SrvUI) *HATResponse {
+	// Save content as a file
+	filePath := filepath.Join(STORE, req.Path+EXT)
+
+	// Compress and encrypt the content
+	compData := zip([]byte(req.Body))
+	encData, err := s.crypto.Enc(compData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to encrypt content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	// Write to storage
+	if err := os.WriteFile(filePath, encData, 0644); err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to save content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	s.scan() // Refresh file list
+	ui.Log(fmt.Sprintf("Saved %s (%d bytes)", req.Path, len(req.Body)))
+
+	return &HATResponse{
+		Type:   "text",
+		Body:   "Content saved successfully",
+		Status: STATUS_GOOD,
+	}
+}
+
+func (s *Srv) handleHATPatch(req *HATRequest, ui *SrvUI) *HATResponse {
+	// Partial update - append to existing content
+	filePath := filepath.Join(STORE, req.Path+EXT)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Resource not found for patching",
+			Status: STATUS_NOTHERE,
+		}
+	}
+
+	// Read existing content
+	encData, err := os.ReadFile(filePath)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to read existing content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	compData, err := s.crypto.Dec(encData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to decrypt existing content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	existingData, err := unzip(compData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to decompress existing content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	// Append new content
+	newData := append(existingData, []byte(req.Body)...)
+
+	// Save updated content
+	newCompData := zip(newData)
+	newEncData, err := s.crypto.Enc(newCompData)
+	if err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to encrypt updated content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	if err := os.WriteFile(filePath, newEncData, 0644); err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to save updated content",
+			Status: STATUS_BAD,
+		}
+	}
+
+	s.scan()
+	ui.Log(fmt.Sprintf("Patched %s (+%d bytes)", req.Path, len(req.Body)))
+
+	return &HATResponse{
+		Type:   "text",
+		Body:   fmt.Sprintf("Content patched successfully. Total size: %d bytes", len(newData)),
+		Status: STATUS_GOOD,
+	}
+}
+
+func (s *Srv) handleHATDelete(req *HATRequest, ui *SrvUI) *HATResponse {
+	// Delete a file
+	filePath := filepath.Join(STORE, req.Path+EXT)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Resource not found for deletion",
+			Status: STATUS_NOTHERE,
+		}
+	}
+
+	// Delete the file
+	if err := os.Remove(filePath); err != nil {
+		return &HATResponse{
+			Type:   "text",
+			Body:   "Failed to delete resource",
+			Status: STATUS_BAD,
+		}
+	}
+
+	s.scan()
+	ui.Log(fmt.Sprintf("Deleted %s", req.Path))
+
+	return &HATResponse{
+		Type:   "text",
+		Body:   "Resource deleted successfully",
+		Status: STATUS_GOOD,
 	}
 }
 
@@ -431,6 +775,151 @@ func (c *Cli) List(addr string) ([]FileItem, error) {
 	return items, nil
 }
 
+// HTTP-like client methods
+func (c *Cli) HATSend(addr string, req *HATRequest) (*HATResponse, error) {
+	// Encode request
+	var reqBuilder strings.Builder
+	reqBuilder.WriteString(FRAME_START)
+	reqBuilder.WriteString(fmt.Sprintf("%s %s\n", req.Method, req.Path))
+	reqBuilder.WriteString(TYPE_HEADER)
+	reqBuilder.WriteString(req.Type)
+	reqBuilder.WriteString("\n\n")
+	reqBuilder.WriteString(CONTENT_START)
+	reqBuilder.WriteString(req.Body)
+	reqBuilder.WriteString(CONTENT_END)
+
+	reqData := reqBuilder.String()
+
+	// Connect and send
+	conn, err := quic.DialAddr(context.Background(), addr, c.tls, qcfg())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.CloseWithError(0, "")
+
+	st, _ := conn.OpenStreamSync(context.Background())
+	defer st.Close()
+
+	// Send HTTP command (3) + request length + request data
+	st.Write([]byte{3})
+	binary.Write(st, binary.BigEndian, uint32(len(reqData)))
+	st.Write([]byte(reqData))
+
+	// Read response length
+	var respLen uint32
+	binary.Read(st, binary.BigEndian, &respLen)
+	respData := make([]byte, respLen)
+	io.ReadFull(st, respData)
+
+	// Parse response
+	return parseHATResponse(respData)
+}
+
+func parseHATResponse(data []byte) (*HATResponse, error) {
+	content := string(data)
+
+	if !strings.HasPrefix(content, FRAME_START) {
+		return nil, fmt.Errorf("invalid response frame")
+	}
+
+	// Split by frame end marker to separate content from status
+	parts := strings.Split(content, FRAME_END)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	contentPart := parts[0]
+	status := strings.TrimSpace(parts[1])
+
+	// Extract type from content part
+	lines := strings.Split(strings.TrimPrefix(contentPart, FRAME_START), "\n")
+	var contentType string
+	for _, line := range lines {
+		if strings.HasPrefix(line, TYPE_HEADER) {
+			contentType = strings.TrimPrefix(line, TYPE_HEADER)
+			break
+		}
+	}
+
+	// Extract body (between CSH and CEH)
+	var body string
+	contentLines := strings.Split(contentPart, "\n")
+	startFound := false
+	var bodyLines []string
+
+	for _, line := range contentLines {
+		if line == strings.TrimSuffix(CONTENT_START, "\n") {
+			startFound = true
+			continue
+		}
+		if line == strings.TrimSuffix(CONTENT_END, "\n") {
+			break
+		}
+		if startFound {
+			bodyLines = append(bodyLines, line)
+		}
+	}
+
+	body = strings.Join(bodyLines, "\n")
+
+	return &HATResponse{
+		Type:   contentType,
+		Body:   body,
+		Status: status,
+	}, nil
+}
+
+// Convenient HTTP method wrappers
+func (c *Cli) HATGet(addr, path, contentType string) (*HATResponse, error) {
+	req := &HATRequest{
+		Method: METHOD_REQUEST,
+		Path:   path,
+		Type:   contentType,
+		Body:   "",
+	}
+	return c.HATSend(addr, req)
+}
+
+func (c *Cli) HATPost(addr, path, contentType, body string) (*HATResponse, error) {
+	req := &HATRequest{
+		Method: METHOD_OPINION,
+		Path:   path,
+		Type:   contentType,
+		Body:   body,
+	}
+	return c.HATSend(addr, req)
+}
+
+func (c *Cli) HATPut(addr, path, contentType, body string) (*HATResponse, error) {
+	req := &HATRequest{
+		Method: METHOD_OPINION,
+		Path:   path,
+		Type:   contentType,
+		Body:   body,
+	}
+	return c.HATSend(addr, req)
+}
+
+func (c *Cli) HATPatch(addr, path, contentType, body string) (*HATResponse, error) {
+	req := &HATRequest{
+		Method: METHOD_CHANGE,
+		Path:   path,
+		Type:   contentType,
+		Body:   body,
+	}
+	return c.HATSend(addr, req)
+}
+
+func (c *Cli) HATDelete(addr, path string) (*HATResponse, error) {
+	req := &HATRequest{
+		Method: METHOD_REMOVE,
+		Path:   path,
+		Type:   "text",
+		Body:   "",
+	}
+	return c.HATSend(addr, req)
+}
+
 type FileItem struct {
 	name string
 	size int64
@@ -442,11 +931,11 @@ func (f FileItem) Description() string { return fmt.Sprintf("%d bytes", f.size) 
 func (f FileItem) FilterValue() string { return f.name }
 
 type SrvUI struct {
-	srv    *Srv
-	logs   []string
-	prog   float64
-	list   list.Model
-	mu     sync.Mutex
+	srv  *Srv
+	logs []string
+	prog float64
+	list list.Model
+	mu   sync.Mutex
 }
 
 func NewSrvUI(srv *Srv) *SrvUI {
@@ -497,7 +986,7 @@ func (s *SrvUI) View() string {
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("DFP Server") + "\n\n")
-	
+
 	b.WriteString(infoStyle.Render("Files:") + "\n")
 	b.WriteString(s.list.View() + "\n\n")
 
@@ -593,7 +1082,7 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case 1:
 		var cmd tea.Cmd
 		c.picker, cmd = c.picker.Update(msg)
-		
+
 		if didSelect, path := c.picker.DidSelectFile(msg); didSelect {
 			c.selFile = path
 			c.state = 2
@@ -650,13 +1139,22 @@ func (c *CliUI) doUpload() tea.Cmd {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: qft <server|client>")
+		fmt.Println("Usage: hat <server|client> [args...]")
+		fmt.Println("Client examples:")
+		fmt.Println("  hat client hat-get <addr> <path> [content-type]")
+		fmt.Println("  hat client hat-post <addr> <path> <content-type> <body>")
+		fmt.Println("  hat client hat-put <addr> <path> <content-type> <body>")
+		fmt.Println("  hat client hat-patch <addr> <path> <content-type> <body>")
+		fmt.Println("  hat client hat-delete <addr> <path>")
+		fmt.Println("  hat client file-upload <addr> <local-file> <remote-name>")
+		fmt.Println("  hat client file-download <addr> <remote-name> <local-file>")
+		fmt.Println("  hat client file-list <addr>")
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
 	case "server":
-		pass := "secret"
+		pass := "HAT"
 		if len(os.Args) > 2 {
 			pass = os.Args[2]
 		}
@@ -670,7 +1168,141 @@ func main() {
 		p.Run()
 
 	case "client":
-		p := tea.NewProgram(NewCliUI())
-		p.Run()
+		if len(os.Args) < 3 {
+			fmt.Println("Client command required")
+			os.Exit(1)
+		}
+
+		cli := NewCli()
+		addr := "127.0.0.1:5000"
+		if len(os.Args) > 3 {
+			addr = os.Args[3]
+		}
+
+		switch os.Args[2] {
+		case "hat-get":
+			if len(os.Args) < 5 {
+				fmt.Println("Usage: hat client hat-get <addr> <path> [content-type=text]")
+				os.Exit(1)
+			}
+			path := os.Args[4]
+			contentType := "text"
+			if len(os.Args) > 5 {
+				contentType = os.Args[5]
+			}
+			resp, err := cli.HATGet(addr, path, contentType)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Type: %s\n", resp.Type)
+			fmt.Printf("Body:\n%s\n", resp.Body)
+
+		case "hat-post":
+			if len(os.Args) < 7 {
+				fmt.Println("Usage: hat client hat-post <addr> <path> <content-type> <body>")
+				os.Exit(1)
+			}
+			path := os.Args[4]
+			contentType := os.Args[5]
+			body := os.Args[6]
+			resp, err := cli.HATPost(addr, path, contentType, body)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Body: %s\n", resp.Body)
+
+		case "hat-put":
+			if len(os.Args) < 7 {
+				fmt.Println("Usage: hat client hat-put <addr> <path> <content-type> <body>")
+				os.Exit(1)
+			}
+			path := os.Args[4]
+			contentType := os.Args[5]
+			body := os.Args[6]
+			resp, err := cli.HATPut(addr, path, contentType, body)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Body: %s\n", resp.Body)
+
+		case "hat-patch":
+			if len(os.Args) < 7 {
+				fmt.Println("Usage: hat client hat-patch <addr> <path> <content-type> <body>")
+				os.Exit(1)
+			}
+			path := os.Args[4]
+			contentType := os.Args[5]
+			body := os.Args[6]
+			resp, err := cli.HATPatch(addr, path, contentType, body)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Body: %s\n", resp.Body)
+
+		case "hat-delete":
+			if len(os.Args) < 5 {
+				fmt.Println("Usage: hat client hat-delete <addr> <path>")
+				os.Exit(1)
+			}
+			path := os.Args[4]
+			resp, err := cli.HATDelete(addr, path)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Body: %s\n", resp.Body)
+
+		case "file-upload":
+			if len(os.Args) < 6 {
+				fmt.Println("Usage: hat client file-upload <addr> <local-file> <remote-name>")
+				os.Exit(1)
+			}
+			localFile := os.Args[4]
+			remoteName := os.Args[5]
+			err := cli.Upload(addr, localFile, remoteName, nil)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Upload successful")
+
+		case "file-download":
+			if len(os.Args) < 6 {
+				fmt.Println("Usage: hat client file-download <addr> <remote-name> <local-file>")
+				os.Exit(1)
+			}
+			remoteName := os.Args[4]
+			localFile := os.Args[5]
+			err := cli.Download(addr, remoteName, localFile, nil)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Download successful")
+
+		case "file-list":
+			files, err := cli.List(addr)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Files on server:")
+			for _, file := range files {
+				fmt.Printf("- %s (%d bytes)\n", file.name, file.size)
+			}
+
+		default:
+			fmt.Printf("Unknown client command: %s\n", os.Args[2])
+			os.Exit(1)
+		}
 	}
 }
